@@ -35,6 +35,8 @@ FINAL_VALIDATE_SCHEMA = _validate_network
 CONF_AUTH_KEY = "auth_key"
 CONF_HOSTNAME = "hostname"
 CONF_MAX_PEERS = "max_peers"
+CONF_DERP_REGION = "derp_region"
+CONF_NETCHECK_OVERRIDE = "netcheck_override"
 CONF_LOGIN_SERVER = "login_server"
 CONF_DISABLE_TELEMETRY = "disable_telemetry"
 tailscale_ns = cg.esphome_ns.namespace("tailscale")
@@ -46,6 +48,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_AUTH_KEY): cv.string,
         cv.Optional(CONF_HOSTNAME, default=""): cv.string,
         cv.Optional(CONF_MAX_PEERS, default=16): cv.int_range(min=1, max=64),
+        # 0 = keep the built-in fallback (ML_DERP_REGION). Set e.g. 5 for Sydney, 4 Frankfurt,
+        # 1 NYC — see the Tailscale DERP map. Without this a device outside the fallback's
+        # region has no way to choose a nearer relay.
+        cv.Optional(CONF_DERP_REGION, default=0): cv.int_range(min=0, max=65535),
+        # Default False, matching upstream: the netcheck can mis-select regions, so it is opt-in.
+        cv.Optional(CONF_NETCHECK_OVERRIDE, default=False): cv.boolean,
         cv.Optional(CONF_LOGIN_SERVER, default=""): cv.string,
         cv.Optional(CONF_DISABLE_TELEMETRY, default=False): cv.boolean,
     }
@@ -59,6 +67,8 @@ async def to_code(config):
     cg.add(var.set_auth_key(config[CONF_AUTH_KEY]))
     cg.add(var.set_hostname(config[CONF_HOSTNAME]))
     cg.add(var.set_max_peers(config[CONF_MAX_PEERS]))
+    cg.add(var.set_derp_region(config[CONF_DERP_REGION]))
+    cg.add(var.set_netcheck_override(config[CONF_NETCHECK_OVERRIDE]))
 
     if config[CONF_LOGIN_SERVER]:
         cg.add(var.set_login_server(config[CONF_LOGIN_SERVER]))
