@@ -288,6 +288,7 @@ typedef struct {
         ML_PEER_ADD,
         ML_PEER_REMOVE,
         ML_PEER_UPDATE_ENDPOINT,
+        ML_PEER_RECONCILE,      /* Full-netmap sync barrier - see `generation` */
     } action;
     uint32_t vpn_ip;
     uint8_t public_key[32];
@@ -316,6 +317,12 @@ typedef struct {
      * peer slot. has_node_id distinguishes "not parsed" from "parsed as 0". */
     bool has_node_id;
     uint64_t node_id;
+
+    /* Map generation. Stamped on every ADD; an ML_PEER_RECONCILE carrying
+     * generation G means "the full netmap G is now applied - drop every peer
+     * not stamped G". Mirrors the reference client's keep-set reconciliation
+     * in tailscale/control/controlclient/map.go:790-818. */
+    uint32_t generation;
 } ml_peer_update_t;
 
 /* ============================================================================
@@ -329,6 +336,9 @@ typedef struct {
     uint8_t disco_key[32];
     char hostname[64];
     bool active;
+
+    /* Map generation this peer was last seen in - see ML_PEER_RECONCILE. */
+    uint32_t generation;
 
     /* Endpoints */
     struct {
@@ -566,6 +576,9 @@ struct microlink_s {
     /* Peers (owned exclusively by wg_mgr task) */
     ml_peer_t peers[ML_MAX_PEERS];
     int peer_count;
+
+    /* Incremented by coord on every full netmap (MapResponse.Peers present). */
+    uint32_t map_generation;
 
     /* STUN results (written by coord, read by coord only) */
     uint32_t stun_public_ip;
@@ -812,6 +825,7 @@ esp_err_t ml_peer_nvs_init(void);
 void ml_peer_nvs_deinit(void);
 esp_err_t ml_peer_nvs_save(const ml_peer_t *peer);
 int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers);
+esp_err_t ml_peer_nvs_remove(const uint8_t *public_key);
 esp_err_t ml_peer_nvs_clear(void);
 
 #ifdef CONFIG_ML_ZERO_COPY_WG

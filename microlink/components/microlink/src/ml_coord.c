@@ -1684,7 +1684,40 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
      *   "Peers"        - Full peer list (initial Stream=false response)
      *   "PeersChanged" - Incremental updates (Stream=true long-poll)
      *   "peers"        - Lowercase fallback */
+    /* `Peers` is a FULL netmap; `PeersChanged` is a delta. The distinction
+     * matters: the reference client treats a full netmap as authoritative and
+     * DELETES every local peer absent from it, because the control plane does
+     * not send PeersRemoved when a peer merely stops being visible to us (an
+     * ACL change, for instance). Conflating the two leaves revoked peers in
+     * the table indefinitely.
+     *
+     * tailscale/control/controlclient/map.go:790-818:
+     *
+     *     if len(resp.Peers) > 0 {          // full netmap, not delta encoded
+     *         keep := make(map[tailcfg.NodeID]bool, len(resp.Peers))
+     *         for _, n := range resp.Peers { keep[n.ID] = true; ... }
+     *         for id := range ms.peers { if !keep[id] { delete(ms.peers, id) } }
+     *         return                        // "Peers precludes all other
+     *     }                                 //  delta operations"
+     *
+     * We cannot hold a keep-set here (wg_mgr owns the peer table and we talk to
+     * it only through a queue), so the equivalent is a generation stamp: every
+     * ADD from full netmap G carries G, and a trailing ML_PEER_RECONCILE tells
+     * wg_mgr to drop anything not stamped G. */
+    bool full_netmap = false;
+
     cJSON *peers = cJSON_GetObjectItem(root, "Peers");
+    /* The reference tests len(resp.Peers) > 0, not merely "is an array"
+     * (map.go:791). That distinction matters: an explicit "Peers": [] would
+     * otherwise bump the generation, add nothing, and make the reconcile
+     * barrier delete every peer we have. Go's omitempty means Tailscale itself
+     * will not send an empty array, but that is a server-side choice and a
+     * different control plane may. */
+    if (peers && cJSON_IsArray(peers) && cJSON_GetArraySize(peers) > 0) {
+        full_netmap = true;
+        ml->map_generation++;
+        ESP_LOGI(TAG, "Full netmap (generation %lu)", (unsigned long)ml->map_generation);
+    }
     if (!peers) {
         peers = cJSON_GetObjectItem(root, "PeersChanged");
         if (peers) ESP_LOGI(TAG, "Using 'PeersChanged' field for peer list");
@@ -1699,15 +1732,17 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     }
 
     int count = cJSON_GetArraySize(peers);
+    int add_failures = 0;
     ESP_LOGI(TAG, "MapResponse: %d peers", count);
 
     cJSON *peer;
     cJSON_ArrayForEach(peer, peers) {
         /* Allocate peer update (freed by wg_mgr after processing) */
         ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-        if (!update) continue;
+        if (!update) { add_failures++; continue; }
 
         update->action = ML_PEER_ADD;
+        update->generation = ml->map_generation;
 
         /* NodeID — Tailscale int64 wire ID. Needed so PeersChangedPatch
          * deltas (which key off ID, not nodekey) can find the peer slot. */
@@ -1843,8 +1878,40 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         /* Send to wg_mgr task via queue */
         if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "Peer update queue full, dropping %s", update->hostname);
+            add_failures++;
             free(update);
         }
+    }
+
+    if (full_netmap && add_failures > 0) {
+        /* Some ADDs never reached wg_mgr, so their peers still carry the old
+         * generation. Sending the barrier now would delete peers the control
+         * plane just told us about - and, since removal also erases the NVS
+         * entry, make that loss persistent. Skip this round; the next full
+         * netmap reconciles. */
+        ESP_LOGW(TAG, "%d peer add(s) failed - skipping reconcile for generation %lu",
+                 add_failures, (unsigned long)ml->map_generation);
+        /* A full Peers list still precludes the delta fields, which "should be
+         * ignored, and should be empty" (tailcfg.go:2050-2051), whether or not
+         * we sent the barrier. */
+        return;
+    } else if (full_netmap) {
+        /* Barrier: everything above carried generation N, so anything still
+         * stamped < N was in our table but is NOT in this netmap. Drop it.
+         * Queued (not dropped) even under pressure - skipping it would silently
+         * retain revoked peers, which is the whole defect this fixes. */
+        ml_peer_update_t *sync = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+        if (sync) {
+            sync->action = ML_PEER_RECONCILE;
+            sync->generation = ml->map_generation;
+            if (xQueueSend(ml->peer_update_queue, &sync, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGW(TAG, "Peer queue full, reconcile for generation %lu dropped",
+                         (unsigned long)ml->map_generation);
+                free(sync);
+            }
+        }
+        /* "Peers precludes all other delta operations" - map.go:812 */
+        return;
     }
 
 check_removed:
@@ -1854,22 +1921,37 @@ check_removed:
         int rm_count = cJSON_GetArraySize(removed);
         ESP_LOGI(TAG, "PeersRemoved: %d peers", rm_count);
 
-        cJSON *key_item;
-        cJSON_ArrayForEach(key_item, removed) {
-            if (!key_item->valuestring) continue;
+        /* PeersRemoved is []NodeID - integers, not nodekey strings
+         * (tailcfg.go:2059-2060: "PeersRemoved are the NodeIDs that are no
+         * longer in the peer list"). Reading valuestring on a JSON number
+         * yields NULL, so every element was skipped and no peer was ever
+         * removed by a delta. A nodekey string is still accepted, because a
+         * non-Tailscale control plane may send that form. */
+        cJSON *item;
+        cJSON_ArrayForEach(item, removed) {
+            ml_peer_update_t *update = NULL;
 
-            ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-            if (!update) continue;
-
-            update->action = ML_PEER_REMOVE;
-
-            const char *hex = key_item->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
-
-            ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
-                     update->public_key[0], update->public_key[1],
-                     update->public_key[2], update->public_key[3]);
+            if (cJSON_IsNumber(item)) {
+                update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+                if (!update) continue;
+                update->action = ML_PEER_REMOVE;
+                update->has_node_id = true;
+                update->node_id = (uint64_t)item->valuedouble;
+                ESP_LOGI(TAG, "  Remove peer: NodeID=%llu",
+                         (unsigned long long)update->node_id);
+            } else if (cJSON_IsString(item) && item->valuestring) {
+                update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+                if (!update) continue;
+                update->action = ML_PEER_REMOVE;
+                const char *hex = item->valuestring;
+                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
+                hex_to_bytes(hex, update->public_key, 32);
+                ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
+                         update->public_key[0], update->public_key[1],
+                         update->public_key[2], update->public_key[3]);
+            } else {
+                continue;
+            }
 
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
@@ -2870,7 +2952,17 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddBoolToObject(root, "Stream", true);
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");    /* Disable compression */
-    cJSON_AddBoolToObject(root, "OmitPeers", true);   /* Already have peers */
+    /* MUST be false on a streaming request. OmitPeers does not mean "I already
+     * have peers" - it means "I am okay with the Peers list being omitted from
+     * the response" (tailcfg.go:1489-1503). Sending it true on the long-poll
+     * asks the control plane to withhold exactly the peer data this stream
+     * exists to deliver, so peer updates never arrive and every delta path
+     * below is dead code.
+     *
+     * The reference only ever sets it from `nu == nil` (direct.go:1138) and
+     * panics if a streaming request has no netmap updater (direct.go:1066-1068),
+     * so it can never send Stream=true with OmitPeers=true. */
+    cJSON_AddBoolToObject(root, "OmitPeers", false);
 
     /* NOTE: With Version >= 68, the control plane IGNORES Endpoints and
      * Hostinfo in Stream=true MapRequests. Endpoints are sent via separate

@@ -264,6 +264,29 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
     return loaded;
 }
 
+/* Drop one peer from the cache. Without this a peer removed from the live
+ * table is still restored at the next boot and re-registered with WireGuard
+ * before the first netmap can reconcile it away - so a revoked peer holds a
+ * valid WireGuard slot for a window on every single boot. */
+esp_err_t ml_peer_nvs_remove(const uint8_t *public_key) {
+    if (!s_initialized || !s_table || !public_key) return ESP_ERR_INVALID_STATE;
+
+    for (int i = 0; i < s_table->count; i++) {
+        if (memcmp(s_table->entries[i].public_key, public_key, 32) != 0) continue;
+
+        /* Compact the tail down over the removed slot. */
+        for (int j = i; j < s_table->count - 1; j++) {
+            s_table->entries[j] = s_table->entries[j + 1];
+        }
+        s_table->count--;
+        memset(&s_table->entries[s_table->count], 0, sizeof(peer_nvs_entry_t));
+        ESP_LOGI(TAG, "Removed cached peer %02x%02x%02x%02x from NVS",
+                 public_key[0], public_key[1], public_key[2], public_key[3]);
+        return flush_table();
+    }
+    return ESP_OK;   /* not cached - nothing to do */
+}
+
 esp_err_t ml_peer_nvs_clear(void) {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
