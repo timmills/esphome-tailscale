@@ -41,6 +41,8 @@ class TailscaleComponent : public Component {
   void set_auth_key(const std::string &key) { this->auth_key_ = key; }
   void set_hostname(const std::string &hostname) { this->hostname_ = hostname; }
   void set_max_peers(uint8_t max) { this->max_peers_ = max; }
+  void set_derp_region(uint16_t region) { this->derp_region_ = region; }
+  void set_netcheck_override(bool enabled) { this->netcheck_override_ = enabled; }
   void set_login_server(const std::string &server) { this->login_server_ = server; }
   void set_telemetry_disabled(bool disabled) { this->telemetry_disabled_ = disabled; }
 #ifdef USE_SWITCH
@@ -149,6 +151,8 @@ class TailscaleComponent : public Component {
   std::string auth_key_;
   std::string hostname_;
   uint8_t max_peers_{16};
+  uint16_t derp_region_{0};        // 0 = use microlink's ML_DERP_REGION fallback
+  bool netcheck_override_{false};  // matches microlink's own default
   std::string login_server_;
   bool telemetry_disabled_{false};
 
