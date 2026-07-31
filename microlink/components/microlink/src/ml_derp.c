@@ -554,13 +554,13 @@ void ml_derp_tx_task(void *arg) {
          * the instant it blocks in a socket call. */
         ml->derp_last_heartbeat_ms = loop_start;
 
-        /* Task-alive heartbeat. Was raised to WARN + 2 s on 2026-05-27 as a temporary aid for the
-         * exit-node throughput hunt; that made it the loudest line in the log, at ~30 lines/minute
-         * forever. Restored to DEBUG + 30 s: still there when you turn the level up, invisible when
-         * you have not. (The comment two lines above already noted the W-spam "was drowning real
-         * warnings" — it was.) */
+        /* The TEMP marker above raised this to WARN every 2 s for a 2026-05-27
+         * throughput investigation; left in, that is ~30 WARN lines a minute on
+         * every device forever. Returned to INFO (the level the comment above
+         * describes as the settled choice) and slowed to 30 s, which keeps it
+         * visible at the default log level without drowning real warnings. */
         if (loop_start - last_heartbeat_ms > 30000) {
-            ESP_LOGD(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+            ESP_LOGI(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
@@ -1138,10 +1138,6 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         derp_write_frame(ml, DERP_FRAME_NOTE_PREFERRED, &preferred, 1);
     }
 
-    /* Seed the liveness clock at connect, so a session that has not yet received anything is not
-     * immediately judged stale by the watchdog above. */
-    ml->derp.last_recv_ms = ml_get_time_ms();
-
     /* Switch socket to short timeout for data phase.
      * Long timeout was needed for TLS handshake, but polling must be fast.
      * 2026-05-27: 200ms was starving the TX side — this single I/O task drains
@@ -1157,6 +1153,8 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     ml->derp.connected = true;
+    /* Already seeded here upstream, which is what the liveness watchdog needs:
+     * a session that has not yet received anything must not read as stale. */
     ml->derp.last_recv_ms = ml_get_time_ms();
     xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECTED);
 
