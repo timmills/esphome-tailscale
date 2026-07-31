@@ -527,6 +527,19 @@ void ml_derp_tx_task(void *arg) {
 
     uint32_t frames_tx = 0;
     uint64_t last_status_ms = 0;
+    /* Non-blocking DERP (re)connect state. Replaces two bounded `for (attempt < 3)` loops that gave
+     * up permanently — after which nothing re-armed ML_EVT_DERP_CONNECT_REQ (it is set only from
+     * ml_coord.c:3175 on coord connect and :2984 on a DERPMap arriving via long-poll, neither of
+     * which fires while coord sits in COORD_LONG_POLL). A ~10 s transient therefore killed the relay
+     * for the lifetime of the boot. Measured on two boards: connected=0 fd=-1 with 1.16M spin loops.
+     *
+     * Retries now continue indefinitely with exponential backoff, matching what the control-plane
+     * reconnect at ml_coord.c:3468 already does correctly. Deliberately NOT a blocking loop: the old
+     * one held the task for up to 6 s, during which the TX queue drained nowhere. */
+    bool     derp_want_connected = false;
+    uint64_t derp_next_attempt_ms = 0;
+    uint32_t derp_backoff_ms = ML_DERP_RETRY_MIN_MS;
+    uint32_t derp_attempt_count = 0;
     uint32_t loop_count = 0;
     uint64_t last_heartbeat_ms = 0;
     uint64_t connected_since_ms = 0;
@@ -574,21 +587,11 @@ void ml_derp_tx_task(void *arg) {
             EventBits_t bits = xEventGroupGetBits(ml->events);
             if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected) {
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
-                /* Retry up to 3 times with 2s backoff */
-                for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
-                    if (attempt > 0) {
-                        ESP_LOGW(TAG, "DERP connect retry %d/3 in 2s...", attempt + 1);
-                        vTaskDelay(pdMS_TO_TICKS(2000));
-                    } else {
-                        ESP_LOGI(TAG, "DERP connect requested, connecting from I/O task");
-                    }
-                    if (ml_derp_connect(ml) == ESP_OK) {
-                        connected_since_ms = ml_get_time_ms();
-                        verbose_phase = true;
-                        break;
-                    }
-                    ESP_LOGW(TAG, "DERP connect attempt %d failed", attempt + 1);
-                }
+                ESP_LOGI(TAG, "DERP connect requested, connecting from I/O task");
+                derp_want_connected = true;
+                derp_next_attempt_ms = 0;                 /* attempt immediately */
+                derp_backoff_ms = ML_DERP_RETRY_MIN_MS;
+                derp_attempt_count = 0;
             }
             if (bits & ML_EVT_DERP_RECONNECT) {
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_RECONNECT);
@@ -603,21 +606,56 @@ void ml_derp_tx_task(void *arg) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                 ml_derp_disconnect(ml);
                 verbose_phase = false;
-                /* Auto-reconnect after disconnect. Backoff softened 2026-05-27
-                 * (1s+3×2s ≈ 7s outage → 200ms+3×500ms) so a transient flap
-                 * costs sub-second, not multi-second, of dropped relay traffic. */
-                vTaskDelay(pdMS_TO_TICKS(200));
-                for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
-                    if (attempt > 0) {
-                        ESP_LOGW(TAG, "DERP reconnect retry %d/3 in 500ms...", attempt + 1);
-                        vTaskDelay(pdMS_TO_TICKS(500));
+                /* Arm the retry loop rather than blocking here. First attempt after a short settle
+                 * so a transient flap still costs sub-second, as the 2026-05-27 tuning intended. */
+                derp_want_connected = true;
+                derp_next_attempt_ms = ml_get_time_ms() + 200;
+                derp_backoff_ms = ML_DERP_RETRY_MIN_MS;
+                derp_attempt_count = 0;
+            }
+        }
+
+        /* ---- Stream-liveness watchdog (the one microlink_internal.h:412 already promised) -----
+         * `derp.last_recv_ms` was written in two places and read in none, despite being documented
+         * as "For keepalive watchdog". A DERP session that goes half-open — NAT state dropped on an
+         * idle relay, which is the common case for a device that relays little traffic — produces
+         * MBEDTLS_ERR_SSL_TIMEOUT on every read, which poll_derp_read maps to "no data", so the
+         * reader loops forever with connected=true and nothing notices.
+         *
+         * This is deliberately NOT another status flag: a relay sends us traffic on its own schedule,
+         * so silence is a fact about the far end, not something we can satisfy ourselves. That is the
+         * distinction the PING/PONG issue in #32 turned on. */
+        if (ml->derp.connected && ml->derp.last_recv_ms != 0) {
+            uint64_t since_rx = ml_get_time_ms() - ml->derp.last_recv_ms;
+            if (since_rx > ML_DERP_RECV_STALE_MS) {
+                ESP_LOGW(TAG, "DERP silent for %llus — relay session presumed dead, reconnecting",
+                         (unsigned long long)(since_rx / 1000));
+                ml->derp.last_recv_ms = ml_get_time_ms();   /* don't re-fire while reconnecting */
+                xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+            }
+        }
+
+        /* ---- DERP (re)connect attempt: one per loop iteration, never gives up ---------------- */
+        if (derp_want_connected && !ml->derp.connected) {
+            uint64_t now = ml_get_time_ms();
+            if (now >= derp_next_attempt_ms) {
+                derp_attempt_count++;
+                if (ml_derp_connect(ml) == ESP_OK) {
+                    ESP_LOGI(TAG, "DERP connected (attempt %lu)", (unsigned long)derp_attempt_count);
+                    connected_since_ms = now;
+                    verbose_phase = true;
+                    derp_backoff_ms = ML_DERP_RETRY_MIN_MS;
+                    derp_attempt_count = 0;
+                } else {
+                    derp_next_attempt_ms = now + derp_backoff_ms;
+                    /* Log the first few, then only on each backoff doubling, so a long outage does
+                     * not become the loudest thing in the log. */
+                    if (derp_attempt_count <= 3 || derp_backoff_ms >= ML_DERP_RETRY_MAX_MS) {
+                        ESP_LOGW(TAG, "DERP connect attempt %lu failed, retry in %lums",
+                                 (unsigned long)derp_attempt_count, (unsigned long)derp_backoff_ms);
                     }
-                    if (ml_derp_connect(ml) == ESP_OK) {
-                        connected_since_ms = ml_get_time_ms();
-                        verbose_phase = true;
-                        break;
-                    }
-                    ESP_LOGW(TAG, "DERP reconnect attempt %d failed", attempt + 1);
+                    derp_backoff_ms *= 2;
+                    if (derp_backoff_ms > ML_DERP_RETRY_MAX_MS) derp_backoff_ms = ML_DERP_RETRY_MAX_MS;
                 }
             }
         }
@@ -1099,6 +1137,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         uint8_t preferred = 0x01;
         derp_write_frame(ml, DERP_FRAME_NOTE_PREFERRED, &preferred, 1);
     }
+
+    /* Seed the liveness clock at connect, so a session that has not yet received anything is not
+     * immediately judged stale by the watchdog above. */
+    ml->derp.last_recv_ms = ml_get_time_ms();
 
     /* Switch socket to short timeout for data phase.
      * Long timeout was needed for TLS handshake, but polling must be fast.
