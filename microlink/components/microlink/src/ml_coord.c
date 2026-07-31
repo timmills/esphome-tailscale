@@ -1778,22 +1778,37 @@ check_removed:
         int rm_count = cJSON_GetArraySize(removed);
         ESP_LOGI(TAG, "PeersRemoved: %d peers", rm_count);
 
-        cJSON *key_item;
-        cJSON_ArrayForEach(key_item, removed) {
-            if (!key_item->valuestring) continue;
+        /* PeersRemoved is []NodeID - integers, not nodekey strings
+         * (tailcfg.go:2059-2060: "PeersRemoved are the NodeIDs that are no
+         * longer in the peer list"). Reading valuestring on a JSON number
+         * yields NULL, so every element was skipped and no peer was ever
+         * removed by a delta. A nodekey string is still accepted, because a
+         * non-Tailscale control plane may send that form. */
+        cJSON *item;
+        cJSON_ArrayForEach(item, removed) {
+            ml_peer_update_t *update = NULL;
 
-            ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-            if (!update) continue;
-
-            update->action = ML_PEER_REMOVE;
-
-            const char *hex = key_item->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
-
-            ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
-                     update->public_key[0], update->public_key[1],
-                     update->public_key[2], update->public_key[3]);
+            if (cJSON_IsNumber(item)) {
+                update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+                if (!update) continue;
+                update->action = ML_PEER_REMOVE;
+                update->has_node_id = true;
+                update->node_id = (uint64_t)item->valuedouble;
+                ESP_LOGI(TAG, "  Remove peer: NodeID=%llu",
+                         (unsigned long long)update->node_id);
+            } else if (cJSON_IsString(item) && item->valuestring) {
+                update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+                if (!update) continue;
+                update->action = ML_PEER_REMOVE;
+                const char *hex = item->valuestring;
+                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
+                hex_to_bytes(hex, update->public_key, 32);
+                ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
+                         update->public_key[0], update->public_key[1],
+                         update->public_key[2], update->public_key[3]);
+            } else {
+                continue;
+            }
 
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
@@ -2660,7 +2675,17 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddBoolToObject(root, "Stream", true);
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");    /* Disable compression */
-    cJSON_AddBoolToObject(root, "OmitPeers", true);   /* Already have peers */
+    /* MUST be false on a streaming request. OmitPeers does not mean "I already
+     * have peers" - it means "I am okay with the Peers list being omitted from
+     * the response" (tailcfg.go:1489-1503). Sending it true on the long-poll
+     * asks the control plane to withhold exactly the peer data this stream
+     * exists to deliver, so peer updates never arrive and every delta path
+     * below is dead code.
+     *
+     * The reference only ever sets it from `nu == nil` (direct.go:1138) and
+     * panics if a streaming request has no netmap updater (direct.go:1066-1068),
+     * so it can never send Stream=true with OmitPeers=true. */
+    cJSON_AddBoolToObject(root, "OmitPeers", false);
 
     /* NOTE: With Version >= 68, the control plane IGNORES Endpoints and
      * Hostinfo in Stream=true MapRequests. Endpoints are sent via separate
