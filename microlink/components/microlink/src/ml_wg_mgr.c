@@ -840,7 +840,10 @@ static void reconcile_peers(microlink_t *ml, uint32_t generation) {
         dropped++;
     }
     if (dropped > 0) {
-        ESP_LOGI(TAG, "Netmap %lu reconciled: %d peer(s) removed, %d remain",
+        /* WARN, not INFO: removing peers is rare and consequential - it tears
+         * down WireGuard configuration - so it should be visible without
+         * raising the log level. The per-peer lines above stay at INFO. */
+        ESP_LOGW(TAG, "Netmap %lu reconciled: %d peer(s) removed, %d remain",
                  (unsigned long)generation, dropped, ml->peer_count);
     }
 }
