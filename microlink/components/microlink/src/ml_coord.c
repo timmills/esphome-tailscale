@@ -1656,13 +1656,14 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     }
 
     int count = cJSON_GetArraySize(peers);
+    int add_failures = 0;
     ESP_LOGI(TAG, "MapResponse: %d peers", count);
 
     cJSON *peer;
     cJSON_ArrayForEach(peer, peers) {
         /* Allocate peer update (freed by wg_mgr after processing) */
         ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-        if (!update) continue;
+        if (!update) { add_failures++; continue; }
 
         update->action = ML_PEER_ADD;
         update->generation = ml->map_generation;
@@ -1801,11 +1802,20 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         /* Send to wg_mgr task via queue */
         if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "Peer update queue full, dropping %s", update->hostname);
+            add_failures++;
             free(update);
         }
     }
 
-    if (full_netmap) {
+    if (full_netmap && add_failures > 0) {
+        /* Some ADDs never reached wg_mgr, so their peers still carry the old
+         * generation. Sending the barrier now would delete peers the control
+         * plane just told us about - and, since removal also erases the NVS
+         * entry, make that loss persistent. Skip this round; the next full
+         * netmap reconciles. */
+        ESP_LOGW(TAG, "%d peer add(s) failed - skipping reconcile for generation %lu",
+                 add_failures, (unsigned long)ml->map_generation);
+    } else if (full_netmap) {
         /* Barrier: everything above carried generation N, so anything still
          * stamped < N was in our table but is NOT in this netmap. Drop it.
          * Queued (not dropped) even under pressure - skipping it would silently

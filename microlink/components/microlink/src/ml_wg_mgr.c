@@ -839,12 +839,25 @@ static void reconcile_peers(microlink_t *ml, uint32_t generation) {
         remove_peer_at(ml, i);
         dropped++;
     }
+    /* Count ACTIVE peers, not peer_count: reconciliation leaves inactive holes
+     * mid-table and peer_count only trims trailing ones, so it overstates. */
+    int active = 0;
+    for (int i = 0; i < ml->peer_count; i++) {
+        if (ml->peers[i].active) active++;
+    }
+
     if (dropped > 0) {
         /* WARN, not INFO: removing peers is rare and consequential - it tears
          * down WireGuard configuration - so it should be visible without
          * raising the log level. The per-peer lines above stay at INFO. */
-        ESP_LOGW(TAG, "Netmap %lu reconciled: %d peer(s) removed, %d remain",
-                 (unsigned long)generation, dropped, ml->peer_count);
+        ESP_LOGW(TAG, "Netmap %lu reconciled: %d peer(s) removed, %d active",
+                 (unsigned long)generation, dropped, active);
+    } else {
+        /* Always say something. "Reconciled and removed nothing" and "reconcile
+         * never ran" are otherwise indistinguishable in a log, which is exactly
+         * what made a peer-count discrepancy hard to diagnose in the field. */
+        ESP_LOGI(TAG, "Netmap %lu reconciled: nothing to remove, %d active",
+                 (unsigned long)generation, active);
     }
 }
 
