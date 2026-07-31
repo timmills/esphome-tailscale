@@ -2968,8 +2968,19 @@ static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
  * accumulator starting mid-message, which then mis-reads JSON bytes as a length
  * prefix. (Observed on hardware: "implausible message size 808333626" - that is
  * the ASCII ":1.0" read as a little-endian uint32.) */
+static int lp_frames_logged = 0;
+
 static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
     if (!data || len == 0) return;
+    if (lp_frames_logged < 4) {
+        char hx[3 * 16 + 1];
+        size_t n = len < 16 ? len : 16;
+        for (size_t k = 0; k < n; k++) sprintf(hx + k * 3, "%02x ", data[k]);
+        hx[n * 3] = '\0';
+        ESP_LOGW(TAG, "lp frame #%d: %u bytes, acc_len=%u, head: %s",
+                 lp_frames_logged, (unsigned)len, (unsigned)ml->lp_acc_len, hx);
+        lp_frames_logged++;
+    }
     if (!ml->lp_acc) {
         ml->lp_acc = ml_psram_malloc(ML_JSON_BUFFER_SIZE);
         ml->lp_acc_len = 0;
@@ -3126,6 +3137,17 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                          isprint(m[0]) ? m[0] : '.', isprint(m[1]) ? m[1] : '.',
                          isprint(m[2]) ? m[2] : '.', isprint(m[3]) ? m[3] : '.',
                          (unsigned)ml->lp_acc_len);
+                {
+                    char hx[3 * 32 + 1], as[33];
+                    size_t n = ml->lp_acc_len < 32 ? ml->lp_acc_len : 32;
+                    for (size_t k = 0; k < n; k++) {
+                        sprintf(hx + k * 3, "%02x ", m[k]);
+                        as[k] = isprint(m[k]) ? m[k] : '.';
+                    }
+                    hx[n * 3] = '\0'; as[n] = '\0';
+                    ESP_LOGW(TAG, "  acc head hex: %s", hx);
+                    ESP_LOGW(TAG, "  acc head asc: %s", as);
+                }
                 ml->lp_acc_len = 0;
                 consumed = 0;
                 break;
