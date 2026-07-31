@@ -1608,7 +1608,34 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
      *   "Peers"        - Full peer list (initial Stream=false response)
      *   "PeersChanged" - Incremental updates (Stream=true long-poll)
      *   "peers"        - Lowercase fallback */
+    /* `Peers` is a FULL netmap; `PeersChanged` is a delta. The distinction
+     * matters: the reference client treats a full netmap as authoritative and
+     * DELETES every local peer absent from it, because the control plane does
+     * not send PeersRemoved when a peer merely stops being visible to us (an
+     * ACL change, for instance). Conflating the two leaves revoked peers in
+     * the table indefinitely.
+     *
+     * tailscale/control/controlclient/map.go:790-818:
+     *
+     *     if len(resp.Peers) > 0 {          // full netmap, not delta encoded
+     *         keep := make(map[tailcfg.NodeID]bool, len(resp.Peers))
+     *         for _, n := range resp.Peers { keep[n.ID] = true; ... }
+     *         for id := range ms.peers { if !keep[id] { delete(ms.peers, id) } }
+     *         return                        // "Peers precludes all other
+     *     }                                 //  delta operations"
+     *
+     * We cannot hold a keep-set here (wg_mgr owns the peer table and we talk to
+     * it only through a queue), so the equivalent is a generation stamp: every
+     * ADD from full netmap G carries G, and a trailing ML_PEER_RECONCILE tells
+     * wg_mgr to drop anything not stamped G. */
+    bool full_netmap = false;
+
     cJSON *peers = cJSON_GetObjectItem(root, "Peers");
+    if (peers && cJSON_IsArray(peers)) {
+        full_netmap = true;
+        ml->map_generation++;
+        ESP_LOGI(TAG, "Full netmap (generation %lu)", (unsigned long)ml->map_generation);
+    }
     if (!peers) {
         peers = cJSON_GetObjectItem(root, "PeersChanged");
         if (peers) ESP_LOGI(TAG, "Using 'PeersChanged' field for peer list");
@@ -1632,6 +1659,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         if (!update) continue;
 
         update->action = ML_PEER_ADD;
+        update->generation = ml->map_generation;
 
         /* NodeID — Tailscale int64 wire ID. Needed so PeersChangedPatch
          * deltas (which key off ID, not nodekey) can find the peer slot. */
@@ -1769,6 +1797,25 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
             ESP_LOGW(TAG, "Peer update queue full, dropping %s", update->hostname);
             free(update);
         }
+    }
+
+    if (full_netmap) {
+        /* Barrier: everything above carried generation N, so anything still
+         * stamped < N was in our table but is NOT in this netmap. Drop it.
+         * Queued (not dropped) even under pressure - skipping it would silently
+         * retain revoked peers, which is the whole defect this fixes. */
+        ml_peer_update_t *sync = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+        if (sync) {
+            sync->action = ML_PEER_RECONCILE;
+            sync->generation = ml->map_generation;
+            if (xQueueSend(ml->peer_update_queue, &sync, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGW(TAG, "Peer queue full, reconcile for generation %lu dropped",
+                         (unsigned long)ml->map_generation);
+                free(sync);
+            }
+        }
+        /* "Peers precludes all other delta operations" - map.go:812 */
+        return;
     }
 
 check_removed:

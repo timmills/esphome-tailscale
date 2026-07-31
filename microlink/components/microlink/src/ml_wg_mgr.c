@@ -693,6 +693,10 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->hostname[sizeof(p->hostname) - 1] = '\0';
     p->derp_region = update->derp_region;
     p->active = true;
+    /* Stamp the netmap generation this peer was last seen in. Deltas carry the
+     * current generation, so a delta-added peer survives until the next full
+     * netmap - which is then authoritative about it. See reconcile_peers(). */
+    p->generation = update->generation;
 
     /* Copy endpoints */
     p->endpoint_count = update->endpoint_count;
@@ -783,10 +787,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     return idx;
 }
 
-static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
-    int idx = find_peer_by_key(ml, update->public_key);
-    if (idx < 0) return;
-
+static void remove_peer_at(microlink_t *ml, int idx) {
     /* Remove from wireguard-lwip */
     if (ml->wg_netif && ml->peers[idx].wg_peer_index >= 0) {
         struct netif *netif = (struct netif *)ml->wg_netif;
@@ -805,6 +806,37 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
     }
 }
 
+static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
+    int idx = find_peer_by_key(ml, update->public_key);
+    if (idx < 0) return;
+    remove_peer_at(ml, idx);
+}
+
+/* Full-netmap reconciliation. coord stamps every peer from netmap generation G
+ * with G, then sends this barrier; anything still on an older generation was in
+ * our table but absent from the netmap, so the control plane is telling us it
+ * is gone. The control plane does NOT send PeersRemoved for a peer that merely
+ * became invisible to us (an ACL change), so without this a revoked peer stays
+ * in the table - and in the WireGuard config - indefinitely.
+ *
+ * Equivalent to the keep-set delete in the reference client,
+ * tailscale/control/controlclient/map.go:790-818. */
+static void reconcile_peers(microlink_t *ml, uint32_t generation) {
+    int dropped = 0;
+    for (int i = 0; i < ml->peer_count; i++) {
+        if (!ml->peers[i].active) continue;
+        if (ml->peers[i].generation == generation) continue;
+        ESP_LOGI(TAG, "Peer absent from netmap %lu, removing: %s",
+                 (unsigned long)generation, ml->peers[i].hostname);
+        remove_peer_at(ml, i);
+        dropped++;
+    }
+    if (dropped > 0) {
+        ESP_LOGI(TAG, "Netmap %lu reconciled: %d peer(s) removed, %d remain",
+                 (unsigned long)generation, dropped, ml->peer_count);
+    }
+}
+
 static void process_peer_updates(microlink_t *ml) {
     ml_peer_update_t *update;
     while (xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
@@ -815,6 +847,9 @@ static void process_peer_updates(microlink_t *ml) {
             break;
         case ML_PEER_REMOVE:
             remove_peer(ml, update);
+            break;
+        case ML_PEER_RECONCILE:
+            reconcile_peers(ml, update->generation);
             break;
         case ML_PEER_UPDATE_ENDPOINT:
             /* Delta from PeersChangedPatch. Look up by NodeID first (the
