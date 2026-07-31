@@ -784,7 +784,11 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 }
 
 static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
-    int idx = find_peer_by_key(ml, update->public_key);
+    /* PeersRemoved identifies peers by NodeID, so look that up first and fall
+     * back to the nodekey (which a non-Tailscale control plane may send, and
+     * which older callers still use). */
+    int idx = update->has_node_id ? find_peer_by_node_id(ml, update->node_id) : -1;
+    if (idx < 0) idx = find_peer_by_key(ml, update->public_key);
     if (idx < 0) return;
 
     /* Remove from wireguard-lwip */
