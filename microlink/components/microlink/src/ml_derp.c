@@ -541,27 +541,27 @@ void ml_derp_tx_task(void *arg) {
          * the instant it blocks in a socket call. */
         ml->derp_last_heartbeat_ms = loop_start;
 
-        /* Unconditional heartbeat - proves task is alive. Was ESP_LOGW so
-         * it would survive any default-log-level filter while debugging
-         * the DERP-stall issue; now downgraded to INFO since the /log
-         * ring + /tailscale diag panel cover that need and the W-spam
-         * was drowning real warnings. */
-        /* TEMP 2026-05-27: WARN + 2s so the SD recorder captures the DERP frame
-         * rate during the exit-node throughput hunt (loop_count vs frames_tx/rx
-         * tells us if the loop spins without progress or is genuinely starved). */
-        if (loop_start - last_heartbeat_ms > 2000) {
-            ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+        /* Task-alive heartbeat. Was raised to WARN + 2 s on 2026-05-27 as a temporary aid for the
+         * exit-node throughput hunt; that made it the loudest line in the log, at ~30 lines/minute
+         * forever. Restored to DEBUG + 30 s: still there when you turn the level up, invisible when
+         * you have not. (The comment two lines above already noted the W-spam "was drowning real
+         * warnings" — it was.) */
+        if (loop_start - last_heartbeat_ms > 30000) {
+            ESP_LOGD(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
             last_heartbeat_ms = loop_start;
         }
 
-        /* ---- Periodic status logging (always, even when disconnected) ---- */
+        /* ---- Periodic status logging (always, even when disconnected) ----
+         * INFO, not WARN: a healthy relay is not a warning. Kept at 10 s because this line is the
+         * one that actually diagnoses a stalled relay (connected/fd/rx/tx/loops together), and it
+         * is cheap at INFO. Raise to WARN only while chasing a specific fault. */
         {
             uint64_t now_ms = loop_start;
             if (now_ms - last_status_ms > 10000) {
-                ESP_LOGW(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
+                ESP_LOGI(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
                          ml->derp.connected, ml->derp.sockfd,
                          (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                          (unsigned long)loop_count);
