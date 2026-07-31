@@ -1815,6 +1815,10 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
          * netmap reconciles. */
         ESP_LOGW(TAG, "%d peer add(s) failed - skipping reconcile for generation %lu",
                  add_failures, (unsigned long)ml->map_generation);
+        /* A full Peers list still precludes the delta fields, which "should be
+         * ignored, and should be empty" (tailcfg.go:2050-2051), whether or not
+         * we sent the barrier. */
+        return;
     } else if (full_netmap) {
         /* Barrier: everything above carried generation N, so anything still
          * stamped < N was in our table but is NOT in this netmap. Drop it.
