@@ -801,6 +801,10 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
     microlink_ip_to_str(ml->peers[idx].vpn_ip, ip_str);
     ESP_LOGI(TAG, "Peer removed: %s (%s)", ml->peers[idx].hostname, ip_str);
 
+    /* Drop the NVS cache entry too, or this peer is restored and re-registered
+     * with WireGuard at the next boot, before any netmap can remove it again. */
+    ml_peer_nvs_remove(ml->peers[idx].public_key);
+
     ml->peers[idx].active = false;
 
     /* Compact peer_count */
