@@ -1649,6 +1649,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
 
 /* Defined below with the long-poll reader; both map paths share one framed stream. */
 static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len);
+extern int lp_frames_logged;
 
 static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     /* Try all field names used by Tailscale (copied from v1 lines 3176-3184):
@@ -2808,6 +2809,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     ESP_LOGI(TAG, "Streaming MapRequest sent on stream 5");
+    lp_frames_logged = 0;   /* re-arm the framing dump for this long-poll session */
     return 0;
 }
 
@@ -2968,7 +2970,7 @@ static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
  * accumulator starting mid-message, which then mis-reads JSON bytes as a length
  * prefix. (Observed on hardware: "implausible message size 808333626" - that is
  * the ASCII ":1.0" read as a little-endian uint32.) */
-static int lp_frames_logged = 0;
+int lp_frames_logged = 0;
 
 static void lp_acc_append(microlink_t *ml, const uint8_t *data, size_t len) {
     if (!data || len == 0) return;
