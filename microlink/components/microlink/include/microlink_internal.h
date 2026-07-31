@@ -133,6 +133,16 @@ extern "C" {
 #define ML_STUN_RESTUN_INTERVAL_MS      23000
 
 /* Control plane timing */
+/* DERP reconnect backoff. Retries are unbounded — a relay-only device that gives up is a device that
+ * needs a site visit. Mirrors the control-plane reconnect at ml_coord.c:3468, which converges to a cap
+ * and never stops trying. */
+#define ML_DERP_RETRY_MIN_MS            500
+#define ML_DERP_RETRY_MAX_MS            60000
+/* DERP stream liveness: a relay sends traffic (keepalives included) well inside this window, so
+ * silence for this long with connected=true means the session is dead even though the socket looks
+ * fine. Reads derp.last_recv_ms, which the code already maintained and never consulted. */
+#define ML_DERP_RECV_STALE_MS           90000
+
 #define ML_CTRL_WATCHDOG_MS             120000
 #define ML_CTRL_BACKOFF_MAX_MS          30000
 #define ML_CTRL_KEEPALIVE_MS            60000
