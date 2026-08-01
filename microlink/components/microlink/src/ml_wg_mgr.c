@@ -54,6 +54,31 @@ static void wg_netif_bring_up_cb(void *ctx)
     netif_set_link_up(netif);
 }
 
+/* Re-address the WireGuard netif after the control plane moves our node to a
+ * different Tailscale IP. Must run on the TCPIP thread for the same reason as
+ * the bring-up above. netif_set_addr() re-runs lwIP's address-change hooks,
+ * which the raw IP4_ADDR() writes used at setup do not. */
+struct wg_readdr_ctx { struct netif *netif; uint32_t ip; };
+
+static void wg_netif_set_addr_cb(void *ctx)
+{
+    struct wg_readdr_ctx *c = (struct wg_readdr_ctx *)ctx;
+    ip4_addr_t addr, mask, gw;
+    ip4_addr_set_u32(&addr, lwip_htonl(c->ip));
+    IP4_ADDR(&mask, 255, 192, 0, 0);   /* /10, as at setup */
+    IP4_ADDR(&gw,   0, 0, 0, 0);
+    netif_set_addr(c->netif, &addr, &mask, &gw);
+}
+
+/* Apply a new VPN address to the live interface. Safe to call from wg_mgr or
+ * coord; blocks until the TCPIP thread has applied it. */
+void ml_wg_mgr_set_vpn_ip(microlink_t *ml, uint32_t new_ip)
+{
+    if (!ml || !ml->wg_netif || new_ip == 0) return;
+    struct wg_readdr_ctx ctx = { .netif = (struct netif *)ml->wg_netif, .ip = new_ip };
+    tcpip_callback_with_block(wg_netif_set_addr_cb, &ctx, 1);
+}
+
 /* Same TCPIP-context rule applies to udp_new() and any UDP-PCB field writes.
  * Allocate the WG output PCB (and stamp its local_port + tos) on the lwIP
  * thread so the asserts in udp.c don't fire on ESP-IDF v5.5+. */

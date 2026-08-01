@@ -656,6 +656,8 @@ void ml_bind_sock_to_upstream(microlink_t *ml, int fd);
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);
 void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
+/* Re-address the WireGuard netif after control moves us to a different IP. */
+void ml_wg_mgr_set_vpn_ip(microlink_t *ml, uint32_t new_ip);
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
 
