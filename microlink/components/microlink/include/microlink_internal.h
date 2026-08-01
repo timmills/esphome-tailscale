@@ -120,7 +120,7 @@ extern "C" {
  * Deliberately 0.x with obviously synthetic hashes: correctly shaped so it
  * parses, while not claiming to be a tailscale release we do not implement.
  * The OS/OSVersion fields already identify the platform as ESP-IDF. */
-#define ML_IPN_VERSION          "0.5.4-t00000000000-g00000000000"
+#define ML_IPN_VERSION          "0.5.4-t000000000-g000000000"
 
 /* DISCO timing (from tailscaled - MUST match for correct behavior) */
 #define ML_DISCO_PING_INTERVAL_MS       5000
