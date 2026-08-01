@@ -1246,6 +1246,59 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
  * State: REGISTER - Send RegisterRequest, parse RegisterResponse
  * ========================================================================== */
 
+/* Build the COMPLETE Hostinfo we report to control.
+ *
+ * There is one of these because there used to be three, hand-built at each call site with
+ * different field sets - and control REPLACES the stored Hostinfo with whatever arrives on a
+ * non-streaming MapRequest. So the endpoint update, which omitted IPNVersion, silently wiped the
+ * version the registration had just set: the admin console showed a version for a few seconds
+ * after every boot and then blank forever. A blank version there is not cosmetic - it is what the
+ * console gates device operations on ("Device is too old").
+ *
+ * The reference keeps a single Hostinfo and clones it for every request
+ * (direct.go:1084 hostInfoLocked), never assembling a partial one per call site. This does the
+ * same thing: every field, every time, so the set cannot drift apart again. */
+static cJSON *build_hostinfo(microlink_t *ml)
+{
+    cJSON *hostinfo = cJSON_CreateObject();
+    if (!hostinfo) return NULL;
+
+    const char *dev_name = (ml->config.device_name && ml->config.device_name[0])
+                             ? ml->config.device_name : microlink_default_device_name();
+    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
+    cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->ipn_version);
+    cJSON_AddStringToObject(hostinfo, "OS", "linux");
+    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
+    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+
+    /* NetInfo — control reads PreferredDERP from here to populate Node.HomeDERP for our peers.
+     * Report the region WE picked from our own netcheck: echoing derp_region_default back is
+     * circular (control echoes what we send, we adopt the echo and resend), so a wrong region is
+     * self-sustaining and can never be measured away, and peers are told to reach us there.
+     * The reference sets its home from its own netcheck report (magicsock/derp.go:197). */
+    cJSON *netinfo = cJSON_CreateObject();
+    if (netinfo) {
+        uint16_t report_derp = ml->derp_preferred_region;
+        if (report_derp == 0) report_derp = ml->derp_home_region;
+        if (report_derp == 0) report_derp = ml->derp_region_default;
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", report_derp);
+        /* Only once STUN has actually measured it - reporting a default would tell control our
+         * NAT behaviour is something we have not established. */
+        if (ml->stun_nat_checked) {
+            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
+        }
+        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
+    }
+
+    /* RoutableIPs: subnet routes this node advertises (--advertise-routes). Each still needs
+     * admin approval on the control plane before traffic flows. */
+    if (ml->advertise_routes[0]) {
+        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
+                              build_routable_ips_array(ml->advertise_routes));
+    }
+    return hostinfo;
+}
+
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
 
@@ -1269,46 +1322,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddItemToObject(root, "Auth", auth);
     }
 
-    /* Hostinfo */
-    cJSON *hostinfo = cJSON_CreateObject();
-    const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->ipn_version);
-    cJSON_AddStringToObject(hostinfo, "OS", "linux");
-    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-
-    /* NetInfo inside Hostinfo — control plane reads PreferredDERP from here
-     * to populate Node.HomeDERP for other peers */
-    {
-        cJSON *netinfo = cJSON_CreateObject();
-        if (netinfo) {
-            /* Report the region WE picked from our own netcheck. Sending
-             * derp_region_default here is circular: the control plane echoes
-             * whatever we send back as Node.HomeDERP, we then adopt that echo
-             * as our default, and send it again - so an initially wrong region
-             * is self-sustaining and can never be measured away. Worse, peers
-             * are told to reach us at that wrong region.
-             *
-             * The reference picks its home DERP from its own netcheck report
-             * (magicsock/derp.go:197 preferredDERP = report.PreferredDERP) and
-             * informs control; control never dictates it. */
-            uint16_t report_derp = ml->derp_preferred_region;
-            if (report_derp == 0) report_derp = ml->derp_home_region;
-            if (report_derp == 0) report_derp = ml->derp_region_default;
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", report_derp);
-            cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-        }
-    }
-
-    /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
+    cJSON_AddItemToObject(root, "Hostinfo", build_hostinfo(ml));
 
     /* NodeKeyChallengeResponse - prove we own the WireGuard private key
      * Server sends challenge public key in EarlyNoise; we respond with
@@ -2433,34 +2447,7 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");  /* Disable compression */
 
-    /* Hostinfo */
-    cJSON *hostinfo = cJSON_CreateObject();
-    const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "IPNVersion", ml->ipn_version);
-    cJSON_AddStringToObject(hostinfo, "OS", "linux");
-    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-    /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-
-    /* NetInfo: tell control plane our preferred DERP region and NAT type.
-     * MUST be inside Hostinfo — the control plane reads Hostinfo.NetInfo.PreferredDERP
-     * to populate Node.HomeDERP for other peers. */
-    cJSON *netinfo = cJSON_CreateObject();
-    if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
-        if (ml->stun_nat_checked) {
-            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-        }
-        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-    }
+    cJSON_AddItemToObject(root, "Hostinfo", build_hostinfo(ml));
 
     /* Include endpoints if STUN has already completed (Stream=false →
      * control plane processes these, unlike Stream=true with Version >= 68) */
@@ -2933,36 +2920,10 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "discokey:%s", key_hex);
     cJSON_AddStringToObject(root, "DiscoKey", key_str);
 
-    /* Hostinfo - REQUIRED by control plane even for Stream=true.
-     * V1 includes this; without it, server may not keep us "online". */
-    cJSON *hostinfo = cJSON_CreateObject();
-    if (hostinfo) {
-        const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-        cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "linux");
-        cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-        cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-        /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-    }
-
-    /* NetInfo: tell control plane our preferred DERP region and NAT type.
-     * MUST be inside Hostinfo — the control plane reads Hostinfo.NetInfo.PreferredDERP
-     * to populate Node.HomeDERP for other peers. */
-    cJSON *netinfo = cJSON_CreateObject();
-    if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->derp_region_default);
-        if (ml->stun_nat_checked) {
-            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-        }
-        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-    }
+    /* Hostinfo. The server MAY ignore this on a streaming request (tailcfg.go:1446-1448),
+     * but v1 sent it and control appears to want it to keep us "online", so it stays - built
+     * from the same place as every other request so the field sets cannot diverge. */
+    cJSON_AddItemToObject(root, "Hostinfo", build_hostinfo(ml));
 
     /* Stream=true for long-poll, KeepAlive=true so server sends keepalives
      * (which marks us as "online" on the control plane) */
@@ -3056,45 +3017,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddBoolToObject(root, "OmitPeers", true);
     cJSON_AddStringToObject(root, "Compress", "");
 
-    /* Hostinfo (required — control plane reads NetInfo from here) */
-    cJSON *hostinfo = cJSON_CreateObject();
-    if (hostinfo) {
-        const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-        cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "linux");
-        cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-        cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-        /* RoutableIPs: subnet routes this node advertises (Tailscale's
-     * --advertise-routes equivalent). Each route still requires admin
-     * approval on the control plane before traffic actually flows. */
-    if (ml->advertise_routes[0]) {
-        cJSON_AddItemToObject(hostinfo, "RoutableIPs",
-                              build_routable_ips_array(ml->advertise_routes));
-    }
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-
-        cJSON *netinfo = cJSON_CreateObject();
-        if (netinfo) {
-            /* Report the region WE picked from our own netcheck. Sending
-             * derp_region_default here is circular: the control plane echoes
-             * whatever we send back as Node.HomeDERP, we then adopt that echo
-             * as our default, and send it again - so an initially wrong region
-             * is self-sustaining and can never be measured away. Worse, peers
-             * are told to reach us at that wrong region.
-             *
-             * The reference picks its home DERP from its own netcheck report
-             * (magicsock/derp.go:197 preferredDERP = report.PreferredDERP) and
-             * informs control; control never dictates it. */
-            uint16_t report_derp = ml->derp_preferred_region;
-            if (report_derp == 0) report_derp = ml->derp_home_region;
-            if (report_derp == 0) report_derp = ml->derp_region_default;
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", report_derp);
-            if (ml->stun_nat_checked) {
-                cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-            }
-            cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-        }
-    }
+    cJSON_AddItemToObject(root, "Hostinfo", build_hostinfo(ml));
 
     /* Endpoints + EndpointTypes */
     int ep_count = add_endpoints_to_json(ml, root);
