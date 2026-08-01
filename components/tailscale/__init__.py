@@ -37,6 +37,7 @@ CONF_HOSTNAME = "hostname"
 CONF_MAX_PEERS = "max_peers"
 CONF_DERP_REGION = "derp_region"
 CONF_NETCHECK_OVERRIDE = "netcheck_override"
+CONF_IPN_VERSION = "ipn_version"
 CONF_LOGIN_SERVER = "login_server"
 CONF_DISABLE_TELEMETRY = "disable_telemetry"
 tailscale_ns = cg.esphome_ns.namespace("tailscale")
@@ -54,6 +55,13 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_DERP_REGION, default=0): cv.int_range(min=0, max=65535),
         # Default False, matching upstream: the netcheck can mis-select regions, so it is opt-in.
         cv.Optional(CONF_NETCHECK_OVERRIDE, default=False): cv.boolean,
+        # Reported as Hostinfo.IPNVersion. Empty = this client's own version, which is honest
+        # but which the Tailscale admin console reads as an old client: it then refuses device
+        # operations with "Device is too old, please upgrade it to the latest version" (an IP
+        # reassignment on a healthy node, verified). Setting this tells your control plane a
+        # version number that is not this software's — a deliberate call for the tailnet
+        # operator, so it is left to you rather than defaulted. Format: "x.y.z-tHASH-gHASH".
+        cv.Optional(CONF_IPN_VERSION, default=""): cv.string,
         cv.Optional(CONF_LOGIN_SERVER, default=""): cv.string,
         cv.Optional(CONF_DISABLE_TELEMETRY, default=False): cv.boolean,
     }
@@ -69,6 +77,9 @@ async def to_code(config):
     cg.add(var.set_max_peers(config[CONF_MAX_PEERS]))
     cg.add(var.set_derp_region(config[CONF_DERP_REGION]))
     cg.add(var.set_netcheck_override(config[CONF_NETCHECK_OVERRIDE]))
+
+    if config[CONF_IPN_VERSION]:
+        cg.add(var.set_ipn_version(config[CONF_IPN_VERSION]))
 
     if config[CONF_LOGIN_SERVER]:
         cg.add(var.set_login_server(config[CONF_LOGIN_SERVER]))

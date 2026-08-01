@@ -328,6 +328,14 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         ml->ctrl_host[sizeof(ml->ctrl_host) - 1] = '\0';
         ESP_LOGI(TAG, "Control plane from config: %s", ml->ctrl_host);
     }
+    strncpy(ml->ipn_version, ML_IPN_VERSION, sizeof(ml->ipn_version) - 1);
+    ml->ipn_version[sizeof(ml->ipn_version) - 1] = '\0';
+    if (ml->config.ipn_version && ml->config.ipn_version[0]) {
+        strncpy(ml->ipn_version, ml->config.ipn_version, sizeof(ml->ipn_version) - 1);
+        ml->ipn_version[sizeof(ml->ipn_version) - 1] = '\0';
+        ESP_LOGW(TAG, "Reporting IPNVersion \"%s\" (overridden; this client is %s)",
+                 ml->ipn_version, ML_IPN_VERSION);
+    }
     if (ml->config.advertise_routes && ml->config.advertise_routes[0]) {
         strncpy(ml->advertise_routes, ml->config.advertise_routes,
                 sizeof(ml->advertise_routes) - 1);

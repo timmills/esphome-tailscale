@@ -120,7 +120,11 @@ extern "C" {
  * Deliberately 0.x with obviously synthetic hashes: correctly shaped so it
  * parses, while not claiming to be a tailscale release we do not implement.
  * The OS/OSVersion fields already identify the platform as ESP-IDF. */
-#define ML_IPN_VERSION          "1.98.9-t000000000-g000000000"
+/* Reported as Hostinfo.IPNVersion, in version.Long format ("x.y.z-tHASH-gHASH",
+ * hostinfo.go:48). This is our own version and is the honest value; see
+ * microlink_config_t::ipn_version for why an operator might override it and
+ * what the admin console does when they do not. */
+#define ML_IPN_VERSION          "0.5.4-t000000000-g000000000"
 
 /* DISCO timing (from tailscaled - MUST match for correct behavior) */
 #define ML_DISCO_PING_INTERVAL_MS       5000
@@ -711,6 +715,9 @@ struct microlink_s {
      * Set from NVS at boot for Headscale/Ionscale/custom coordinators,
      * or from microlink_config_t.ctrl_host when supplied directly. */
     char ctrl_host[64];
+    /* Reported as Hostinfo.IPNVersion. Defaults to ML_IPN_VERSION; the
+     * embedder can override it (see microlink_config_t::ipn_version). */
+    char ipn_version[48];
 
     /* Parsed host and port from ctrl_host (filled lazily by do_tcp_connect).
      * ctrl_host_parsed is the bare hostname/IP, ctrl_port_str the port as

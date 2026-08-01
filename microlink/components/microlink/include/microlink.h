@@ -82,6 +82,25 @@ typedef struct {
      * compile-time fallback (Frankfurt). This value is also sent as
      * MapRequest.Hostinfo.NetInfo.PreferredDERP so peers know our home. */
     uint16_t preferred_derp_region;
+
+    /* Value reported as Hostinfo.IPNVersion (version.Long format,
+     * "x.y.z-tHASH-gHASH"). NULL/empty = ML_IPN_VERSION, this client's own
+     * version, which is the honest answer.
+     *
+     * Be aware of what that costs: the Tailscale admin console gates device
+     * operations on this string and refuses anything it reads as an old
+     * client - "Device is too old, please upgrade it to the latest version".
+     * A verified case: reassigning a healthy node's address is refused while
+     * it reports 0.5.4, and succeeds unchanged when it reports a current
+     * release number. The control plane already knows our actual protocol
+     * level from MapRequest.Version (CapabilityVersion), so this is a
+     * product-identity check, not a compatibility one.
+     *
+     * Overriding it therefore means telling your control plane a version
+     * number that is not this software's. That is a deliberate decision for
+     * the operator of a tailnet to make, so it is exposed rather than
+     * decided here, and the default does not make it for you. */
+    const char *ipn_version;
 } microlink_config_t;
 
 /* Single CIDR route entry — used for subnet-router advertisements. */

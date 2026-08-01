@@ -137,6 +137,7 @@ void TailscaleComponent::start_microlink_() {
   config.device_name = this->hostname_.empty() ? nullptr : this->hostname_.c_str();
   config.max_peers = this->max_peers_;
   config.preferred_derp_region = this->derp_region_;
+  config.ipn_version = this->ipn_version_.empty() ? nullptr : this->ipn_version_.c_str();
   config.netcheck_override_enabled = this->netcheck_override_;
   config.ctrl_host = this->login_server_.empty() ? nullptr : this->login_server_.c_str();
 
@@ -355,6 +356,9 @@ void TailscaleComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "Tailscale:");
   ESP_LOGCONFIG(TAG, "  Hostname: %s", this->hostname_.empty() ? "(auto)" : this->hostname_.c_str());
   ESP_LOGCONFIG(TAG, "  Max Peers: %u", this->max_peers_);
+  if (!this->ipn_version_.empty()) {
+    ESP_LOGCONFIG(TAG, "  IPNVersion: %s (overridden)", this->ipn_version_.c_str());
+  }
   if (this->derp_region_ != 0) {
     ESP_LOGCONFIG(TAG, "  DERP Region: %u (configured)", this->derp_region_);
   } else {
