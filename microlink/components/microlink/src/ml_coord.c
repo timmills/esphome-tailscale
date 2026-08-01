@@ -40,6 +40,9 @@
 
 static const char *TAG = "ml_coord";
 
+/* Adopt the address control says is ours, re-addressing the interface if it changed. */
+static void adopt_self_address(microlink_t *ml, cJSON *node);
+
 /* Pin a freshly-created BSD socket to the upstream (STA) netif via
  * SO_BINDTODEVICE (lwIP -> tcp_bind_netif), so the ESP's OWN control-plane /
  * DERP TCP always egresses the physical uplink and is immune to the
@@ -1614,19 +1617,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     /* Extract our VPN IP from Node.Addresses */
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
     if (node) {
-        cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-        if (addresses && cJSON_GetArraySize(addresses) > 0) {
-            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-            if (addr) {
-                unsigned a, b, c, d;
-                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                    ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                    char ip_str[16];
-                    microlink_ip_to_str(ml->vpn_ip, ip_str);
-                    ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
-                }
-            }
-        }
+        adopt_self_address(ml, node);
         /* Parse self-node DERP region — try modern HomeDERP (int) first,
          * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
         /* Parse self-Node.HomeDERP just for logging — this field is only the
@@ -2363,6 +2354,47 @@ static bool parse_derp_map_from_response(microlink_t *ml, cJSON *map_json) {
     return ml->derp_region_count > 0;
 }
 
+/* Adopt the address the control plane says is ours.  Both the initial netmap
+ * and later long-poll updates carry Node.Addresses, and control can move a node
+ * to a different address at any time (an admin reassignment, for one).  When it
+ * does, recording the new value is not enough: lwIP has to be re-addressed too,
+ * or the device keeps answering on an address control and every peer have
+ * stopped using, and is unreachable until it is rebooted. */
+static void adopt_self_address(microlink_t *ml, cJSON *node)
+{
+    cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
+    if (!addresses || cJSON_GetArraySize(addresses) == 0) return;
+
+    /* Addresses is ordered v4-then-v6; take the first parseable v4. */
+    uint32_t new_ip = 0;
+    int n = cJSON_GetArraySize(addresses);
+    for (int i = 0; i < n && new_ip == 0; i++) {
+        cJSON *entry = cJSON_GetArrayItem(addresses, i);
+        if (!entry || !entry->valuestring) continue;
+        unsigned a, b, c, d;
+        if (sscanf(entry->valuestring, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) continue;
+        if (a > 255 || b > 255 || c > 255 || d > 255) continue;
+        new_ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | (uint32_t)d;
+    }
+    if (new_ip == 0 || new_ip == ml->vpn_ip) return;
+
+    char new_str[16];
+    microlink_ip_to_str(new_ip, new_str);
+
+    if (ml->vpn_ip == 0) {
+        ml->vpn_ip = new_ip;
+        ESP_LOGI(TAG, "Our VPN IP: %s", new_str);
+        return;   /* interface not addressed yet; wg_mgr picks it up at init */
+    }
+
+    char old_str[16];
+    microlink_ip_to_str(ml->vpn_ip, old_str);
+    ml->vpn_ip = new_ip;
+    ml_wg_mgr_set_vpn_ip(ml, new_ip);
+    ESP_LOGW(TAG, "VPN IP changed %s -> %s (applied to interface)", old_str, new_str);
+}
+
+
 /* Fetch + parse one full MapResponse (Node, peers, DERPMap).
  *
  * send_request=true: send a non-streaming (Stream=false) MapRequest on H2
@@ -2778,22 +2810,7 @@ static int do_map_exchange(microlink_t *ml, ml_noise_state_t *noise, bool send_r
     {
         cJSON *node = cJSON_GetObjectItem(map_json, "Node");
         if (node) {
-            /* Extract VPN IP if not already set */
-            if (ml->vpn_ip == 0) {
-                cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-                if (addresses && cJSON_GetArraySize(addresses) > 0) {
-                    const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-                    if (addr) {
-                        unsigned a, b, c, d;
-                        if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                            ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                            char ip_str[16];
-                            microlink_ip_to_str(ml->vpn_ip, ip_str);
-                            ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
-                        }
-                    }
-                }
-            }
+            adopt_self_address(ml, node);
             /* Parse self-node DERP region — try modern HomeDERP (int) first,
              * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
             cJSON *home_derp = cJSON_GetObjectItem(node, "HomeDERP");
@@ -3140,20 +3157,7 @@ static void apply_long_poll_map(microlink_t *ml, cJSON *update_json) {
     /* Update VPN IP if present */
     cJSON *node = cJSON_GetObjectItem(update_json, "Node");
     if (node) {
-        cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-        if (addresses && cJSON_GetArraySize(addresses) > 0) {
-            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-            if (addr) {
-                unsigned a, b, c, d;
-                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                    uint32_t new_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                    if (new_ip != ml->vpn_ip) {
-                        ml->vpn_ip = new_ip;
-                        ESP_LOGI(TAG, "VPN IP updated via long-poll");
-                    }
-                }
-            }
-        }
+        adopt_self_address(ml, node);
     }
 
     /* Parse peer updates */

@@ -771,6 +771,8 @@ void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
 /* Called from the DERP task when a relay reports PeerGone for a peer: it has
  * no path there, so stop driving handshakes through it for a while. */
 void ml_wg_mgr_notify_derp_gone(microlink_t *ml, const uint8_t *public_key);
+/* Re-address the WireGuard netif after control moves us to a different IP. */
+void ml_wg_mgr_set_vpn_ip(microlink_t *ml, uint32_t new_ip);
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
 
