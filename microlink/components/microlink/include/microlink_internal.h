@@ -82,6 +82,7 @@ extern "C" {
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
+#define ML_DERP_GONE_QUEUE_DEPTH 64
 
 /* Protocol limits */
 #define ML_MAX_PEERS            CONFIG_ML_MAX_PEERS
@@ -325,6 +326,7 @@ typedef struct {
     uint64_t last_pong_recv_ms;     /* Last DISCO pong we received */
     uint64_t trust_until_ms;        /* Direct path trusted until */
     uint64_t last_send_ms;          /* Last data sent to this peer */
+    uint64_t last_data_recv_ms;     /* Last inbound WG packet seen (wg_mgr-owned, idle-gate) */
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
 
     /* Best direct path */
@@ -503,6 +505,7 @@ struct microlink_s {
     QueueHandle_t stun_rx_queue;        /* net_io -> coord */
     QueueHandle_t coord_cmd_queue;      /* any -> coord */
     QueueHandle_t peer_update_queue;    /* coord -> wg_mgr */
+    QueueHandle_t derp_gone_queue;      /* DERP RX task -> wg_mgr (32-byte peer key) */
 
     /* Keys (loaded at init, read-only after) */
     uint8_t machine_private_key[32];    /* Noise machine key */

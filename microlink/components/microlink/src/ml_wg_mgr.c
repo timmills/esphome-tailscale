@@ -707,6 +707,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->last_pong_recv_ms = 0;
     p->trust_until_ms = 0;
     p->last_send_ms = 0;
+    p->last_data_recv_ms = 0;
     p->last_upgrade_ms = 0;
     p->has_direct_path = false;
     p->best_ip = 0;
@@ -783,20 +784,43 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     return idx;
 }
 
-/* Called from the DERP task when a relay reports PeerGone. The reference drops
- * its DERP route for the peer (magicsock/derp.go:652-665); there is no route
- * table here, so the equivalent is to stop pushing WireGuard handshakes through
- * a relay that has just said it cannot deliver them. Writing one timestamp from
- * another task is safe: a torn read costs at most one extra or skipped retry. */
+/* Called from the DERP RX task when a relay reports PeerGone. The reference
+ * drops its DERP route for the peer (magicsock/derp.go:652-665); here the
+ * equivalent is to stop pushing WireGuard handshakes through a relay that just
+ * said it cannot deliver them. A PeerGone burst is NORMAL on a relay whose
+ * peers live elsewhere, so this DERP-task path stays cheap and does not own
+ * ml->peers: it hands the 32-byte key to wg_mgr via a dedicated queue. wg_mgr
+ * (sole owner of ml->peers) applies the backoff and logs, rate-limited, in
+ * drain_derp_gone_queue(). Drop if the queue is full - the backoff is advisory
+ * and the next PeerGone for the same peer re-arms it. */
 void ml_wg_mgr_notify_derp_gone(microlink_t *ml, const uint8_t *public_key) {
-    if (!ml || !public_key) return;
-    for (int i = 0; i < ml->peer_count; i++) {
-        if (!ml->peers[i].active) continue;
-        if (memcmp(ml->peers[i].public_key, public_key, 32) != 0) continue;
-        ml->peers[i].derp_gone_until_ms = ml_get_time_ms() + ML_DERP_GONE_BACKOFF_MS;
-        ESP_LOGW(TAG, "Relay reports no path to %s - pausing DERP handshakes for %ds",
-                 ml->peers[i].hostname, ML_DERP_GONE_BACKOFF_MS / 1000);
-        return;
+    if (!ml || !public_key || !ml->derp_gone_queue) return;
+    (void)xQueueSend(ml->derp_gone_queue, public_key, 0);
+}
+
+/* Drained on the wg_mgr task (sole owner of ml->peers). Applies the DERP
+ * backoff each queued PeerGone asked for, rate-limiting the log so a burst
+ * cannot become the stall it reports (cf. the DISCO probe-table-full log). */
+static void drain_derp_gone_queue(microlink_t *ml) {
+    if (!ml->derp_gone_queue) return;
+    uint8_t key[32];
+    while (xQueueReceive(ml->derp_gone_queue, key, 0) == pdTRUE) {
+        int idx = find_peer_by_key(ml, key);
+        if (idx < 0 || !ml->peers[idx].active) continue;
+        ml->peers[idx].derp_gone_until_ms = ml_get_time_ms() + ML_DERP_GONE_BACKOFF_MS;
+        static uint64_t last_log_ms = 0;
+        static uint32_t suppressed = 0;
+        uint64_t now_ms = ml_get_time_ms();
+        if (now_ms - last_log_ms > 10000) {
+            ESP_LOGW(TAG, "Relay reports no path to %s - pausing DERP handshakes for %ds"
+                          " (%lu more suppressed in the last 10s)",
+                     ml->peers[idx].hostname, ML_DERP_GONE_BACKOFF_MS / 1000,
+                     (unsigned long)suppressed);
+            last_log_ms = now_ms;
+            suppressed = 0;
+        } else {
+            suppressed++;
+        }
     }
 }
 
@@ -1467,6 +1491,12 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
         free(pkt->data);
         return;
     }
+    /* wg_mgr's own inbound-activity stamp for this peer, so the DISCO idle-gate
+     * reads wg_mgr state instead of struct wireguard_peer from the probe loop. */
+    {
+        int pidx = find_peer_by_key(ml, pkt->src_pubkey);
+        if (pidx >= 0) ml->peers[pidx].last_data_recv_ms = ml_get_time_ms();
+    }
 
     struct netif *netif = (struct netif *)ml->wg_netif;
     void *device = netif->state;
@@ -1741,21 +1771,22 @@ static void disco_periodic_probes(microlink_t *ml) {
          * alone blocking the main loop for 3 s at a time.
          *
          * Trust expiry below still runs: this gates new probes, not bookkeeping. */
+        /* Idleness from wg_mgr's OWN bookkeeping - last inbound WG data
+         * (stamped in process_wg_packet) or last DISCO pong - never a
+         * cross-task read of struct wireguard_peer from this probe loop. Both
+         * are ml_get_time_ms() timestamps; 0 == "never heard from", so at boot
+         * nothing is idle (the gate is blind then - the rate-limited
+         * probe-table-full log is what protects against the boot probe storm).
+         * Deviation from the reference (endpoint.go:835 gates on lastSend): we
+         * gate on last-HEARD, because wg_mgr does not see the data-tx path and
+         * stamping our own DISCO sends here would make the gate self-sustaining
+         * (a peer we keep probing would never look idle). */
         bool session_idle = false;
-        if (p->wg_peer_index >= 0 && p->wg_peer_index < WIREGUARD_MAX_PEERS && ml->wg_netif) {
-            struct netif *netif_i = (struct netif *)ml->wg_netif;
-            struct wireguard_device *dev_i = (struct wireguard_device *)netif_i->state;
-            if (dev_i) {
-                struct wireguard_peer *wp_i = &dev_i->peers[p->wg_peer_index];
-                uint32_t now_wg = wireguard_sys_now();
-                uint32_t last_any = wp_i->last_rx;
-                if (wp_i->last_tx > last_any) last_any = wp_i->last_tx;
-                if (last_any != 0) {
-                    uint32_t age = now_wg - last_any;
-                    if (age <= 0x7FFFFFFFu && age > ML_DISCO_SESSION_ACTIVE_MS) {
-                        session_idle = true;
-                    }
-                }
+        {
+            uint64_t last_heard = p->last_data_recv_ms;
+            if (p->last_pong_recv_ms > last_heard) last_heard = p->last_pong_recv_ms;
+            if (last_heard != 0 && (ml_get_time_ms() - last_heard) > ML_DISCO_SESSION_ACTIVE_MS) {
+                session_idle = true;
             }
         }
 
@@ -2085,6 +2116,7 @@ void ml_wg_mgr_task(void *arg) {
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         /* Process peer updates from coord task */
         process_peer_updates(ml);
+        drain_derp_gone_queue(ml);
 
         /* Track DERP connection state for DISCO.
          * Note: We DON'T re-initiate WG handshakes on DERP connect because
