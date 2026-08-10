@@ -358,6 +358,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_rx_queue = xQueueCreate(ML_STUN_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
     ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
     ml->peer_update_queue = xQueueCreate(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *));
+    ml->derp_gone_queue = xQueueCreate(ML_DERP_GONE_QUEUE_DEPTH, 32);
 
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
         !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue) {
@@ -589,6 +590,7 @@ void microlink_destroy(microlink_t *ml) {
     if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
     if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
     if (ml->peer_update_queue) vQueueDelete(ml->peer_update_queue);
+    if (ml->derp_gone_queue) vQueueDelete(ml->derp_gone_queue);
 
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);
